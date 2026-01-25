@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Import models
 from models.autoencoders.vae import VAE
-from models.autoencoders.improved_losses import EnhancedVAELoss
+from models.autoencoders.losses import EnhancedVAELoss
 from datasets.imagenet_dataset import ImageNetDataset
 from utils.ema import EMA
 
