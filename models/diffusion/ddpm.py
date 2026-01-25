@@ -67,28 +67,30 @@ class DDPM(nn.Module):
         
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, x_start, condition, t, noise=None):
+    def p_losses(self, x_start, t, context=None, noise=None):
         """
-        Calculate loss for a batch
-        x_start: Target mask (ground truth)
-        condition: Input image (CT/MRI)
+        Calculate diffusion loss for text-conditional generation
+        
+        Args:
+            x_start: Clean latent (B, latent_ch, H, W)
+            t: Timestep (B,)
+            context: Text embeddings (B, 77, 768) - for cross-attention
+            noise: Optional pre-generated noise
+        Returns:
+            loss: MSE between true noise and predicted noise
         """
         if noise is None:
             noise = torch.randn_like(x_start)
             
-        # Diffuse mask
+        # Add noise to clean latent: x_t = √ᾱ_t * x_0 + √(1-ᾱ_t) * ε
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         
-        # Predict noise
-        # Note: Model expects cat(condition, x_noisy) or handles both. 
-        # Update: DMK Model `forward` uses input_proj. We should concatenate here if model expects single input tensor
-        # OR model.forward(x_noisy, t, condition) if we update the model signature.
-        # Given typical segmentation setups, we usually Concat channel-wise.
+        # Predict noise using cross-attention with text
+        # Model signature: model(x_noisy, t, context)
+        # Context is injected via cross-attention, NOT concatenation!
+        predicted_noise = self.model(x_noisy, t, context)
         
-        model_input = torch.cat([condition, x_noisy], dim=1) # (B, C_img+C_mask, H, W)
-        predicted_noise = self.model(model_input, t)
-        
-        # Loss
+        # Loss: MSE between true noise and predicted noise
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, predicted_noise)
         elif self.loss_type == 'l2':

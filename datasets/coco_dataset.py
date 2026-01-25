@@ -69,19 +69,24 @@ class COCODataset(Dataset):
         
         print(f"COCO {split}: Found {len(self.images)} images with captions")
         
-        # Transforms
+        # Transforms with proper augmentation
         if center_crop:
+            # For validation: deterministic center crop
             self.transform = transforms.Compose([
-                transforms.Resize(image_size),
+                transforms.Resize(image_size, interpolation=transforms.InterpolationMode.BICUBIC),
                 transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # [-1, 1]
             ])
         else:
+            # For training: random augmentation
             self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
+                transforms.Resize(int(image_size * 1.1), interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.RandomCrop(image_size),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
                 transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # [-1, 1]
             ])
     
     def __len__(self):

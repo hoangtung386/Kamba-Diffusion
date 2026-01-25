@@ -110,7 +110,7 @@ class Encoder(nn.Module):
 class KANDecoder(nn.Module):
     """
     KAN-based Decoder for VAE (NOVEL!)
-    Uses KAN blocks from existing codebase for interpretable upsampling
+    Uses KAN blocks from autoencoders package for interpretable upsampling
     
     32x32 -> 64x64 -> 128x128 -> 256x256
     """
@@ -124,9 +124,9 @@ class KANDecoder(nn.Module):
     ):
         super().__init__()
         
-        # Import KAN block from existing decoder
+        # Import KAN block from autoencoders package (NOT decoders!)
         if use_kan:
-            from models.decoders.kan_decoder import KANBlock2d
+            from models.autoencoders.kan_blocks import KANBlock2d
             self.BlockType = KANBlock2d
         else:
             self.BlockType = ResBlock
