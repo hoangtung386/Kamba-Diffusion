@@ -303,8 +303,8 @@ Contributions welcome! Please:
 ## 📧 Contact
 
 For questions or collaborations:
-- GitHub Issues: [Create an issue](https://github.com/yourusername/DMK-ImageGen/issues)
-- Email: your.email@example.com
+- GitHub Issues: [Create an issue](https://github.com/hoangtung386/Kamba-Diffusion/issues)
+- Email: levuhoangtung1542003@gmail.com
 
 ---
 
