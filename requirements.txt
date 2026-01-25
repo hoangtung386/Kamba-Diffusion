@@ -1,13 +1,25 @@
+# transformers - for CLIP text encoder
+transformers>=4.30.0
+
+# mamba-ssm - for Mamba blocks (State Space Models)
+mamba-ssm>=1.0.0
+
+# core
 torch>=2.0.0
 torchvision>=0.15.0
-numpy>=1.21.0
-timm>=0.9.0
 einops>=0.6.0
-opencv-python>=4.8.0
-matplotlib>=3.7.0
-tqdm>=4.65.0
-wandb>=0.15.0
-scipy>=1.10.0
-pillow>=9.0.0
-# Note: mamba-ssm is platform dependent, install manually if needed
-# mamba-ssm>=1.0.1
+
+# training
+tqdm>=4.60.0
+tensorboard>=2.11.0
+
+# data
+Pillow>=9.0.0
+
+# utilities
+pyyaml>=6.0
+numpy>=1.24.0
+
+# optional: for advanced features
+# webdataset>=0.2.0  # For LAION large-scale loading
+# accelerate>=0.20.0  # For distributed training
