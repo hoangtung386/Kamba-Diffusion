@@ -1,25 +1,94 @@
-# transformers - for CLIP text encoder
-transformers>=4.30.0
+# ============================================
+# Kamba Diffusion - Requirements
+# Text-to-Image Generation with Mamba + KAN
+# ============================================
 
-# mamba-ssm - for Mamba blocks (State Space Models)
-mamba-ssm>=1.0.0
-
-# core
+# Core Deep Learning
 torch>=2.0.0
 torchvision>=0.15.0
-einops>=0.6.0
-
-# training
-tqdm>=4.60.0
-tensorboard>=2.11.0
-
-# data
-Pillow>=9.0.0
-
-# utilities
-pyyaml>=6.0
 numpy>=1.24.0
 
-# optional: for advanced features
-# webdataset>=0.2.0  # For LAION large-scale loading
-# accelerate>=0.20.0  # For distributed training
+# Mamba State Space Models
+mamba-ssm>=1.0.0
+# Note: Requires CUDA. Install with: pip install mamba-ssm
+
+# Text Encoding (CLIP)
+transformers>=4.30.0
+# For CLIP text encoder and tokenizer
+
+# Tensor Operations
+einops>=0.6.0
+# For efficient tensor reshaping in Mamba blocks
+
+# Image Processing
+Pillow>=9.0.0
+# For image loading and saving
+
+# Training & Logging
+tqdm>=4.60.0
+tensorboard>=2.11.0
+# For progress bars and training visualization
+
+# Configuration
+pyyaml>=6.0
+# For config files (optional, not used yet)
+
+# ============================================
+# Optional Dependencies (Advanced Features)
+# ============================================
+
+# For large-scale dataset loading (LAION)
+# webdataset>=0.2.0
+# Uncomment if using LAION-5B streaming
+
+# For distributed multi-GPU training
+# accelerate>=0.20.0
+# Uncomment for DDP/FSDP training
+
+# For faster sampling
+# diffusers>=0.20.0
+# Optional: Can import DPM-Solver++ implementation
+
+# For evaluation metrics
+# lpips>=0.1.4
+# pytorch-fid>=0.3.0
+# Uncomment for perceptual metrics and FID scores
+
+# For web demo
+# gradio>=3.40.0
+# streamlit>=1.25.0
+# Uncomment if building interactive demo
+
+# ============================================
+# Development Tools (Optional)
+# ============================================
+
+# For code quality
+# black>=23.0.0
+# flake8>=6.0.0
+# mypy>=1.0.0
+
+# For testing
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+
+# ============================================
+# Installation Notes
+# ============================================
+
+# 1. Install PyTorch first with CUDA support:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# 2. Install Mamba (requires CUDA):
+#    pip install mamba-ssm
+
+# 3. Install remaining dependencies:
+#    pip install -r requirements.txt
+
+# 4. Verify installation:
+#    python -c "import torch; import mamba_ssm; import transformers; print('✅ All dependencies installed')"
+
+# ============================================
+# Minimum CUDA Version: 11.8
+# Recommended GPU: NVIDIA A6000 (48GB) or RTX 4090 (24GB)
+# ============================================
