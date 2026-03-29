@@ -1,0 +1,44 @@
+# VAE Training Configuration
+# Usage: python scripts/train_vae.py --config configs/vae_train.yaml
+
+model:
+  in_channels: 3
+  latent_channels: 4
+  hidden_dims: [128, 256, 512, 512]
+  image_size: 256
+  num_res_blocks: 2
+  dropout: 0.0
+  use_kan_decoder: true
+
+loss:
+  kl_weight: 1.0e-6
+  perceptual_weight: 1.0
+  use_perceptual: true
+  use_gan: true
+  gan_weight: 0.5
+  disc_start_epoch: 10
+
+training:
+  batch_size: 64
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  num_workers: 8
+  use_amp: true
+  use_ema: true
+  ema_decay: 0.9999
+  gradient_accumulation_steps: 1
+  seed: 42
+
+logging:
+  exp_name: vae_imagenet
+  output_dir: experiments
+  log_every: 100
+  val_every: 1
+  sample_every: 5
+  save_every: 10
+
+data:
+  data_root: /path/to/imagenet
+  image_size: 256
