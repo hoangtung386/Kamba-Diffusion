@@ -1,0 +1,38 @@
+# Generation Configuration
+# Usage: python scripts/generate.py --config configs/generate.yaml
+
+model:
+  vae:
+    in_channels: 3
+    latent_channels: 4
+    hidden_dims: [128, 256, 512, 512]
+    image_size: 256
+    use_kan_decoder: true
+  denoiser:
+    in_channels: 4
+    out_channels: 4
+    model_channels: 320
+    channel_mult: [1, 2, 4, 4]
+    num_res_blocks: 2
+    attention_resolutions: [1, 2, 3]
+    context_dim: 768
+    num_heads: 8
+    use_cross_attn: true
+
+checkpoints:
+  vae: /path/to/vae_best.pth
+  denoiser: /path/to/ldm_best.pth
+
+generation:
+  num_steps: 50
+  guidance_scale: 7.5
+  eta: 0.0
+  num_samples: 1
+  image_size: 256
+  output_dir: outputs
+
+prompts:
+  - A photo of a cat sitting on a table
+  - A beautiful sunset over mountains
+  - A dog playing in the park
+  - A modern cityscape at night

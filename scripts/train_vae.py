@@ -1,462 +1,388 @@
-"""
-Improved VAE Training Script with:
-- GAN discriminator
-- EMA
-- Mixed precision
-- Better logging
-- Proper validation
+"""VAE training script with GAN, EMA, and mixed precision support.
+
+Usage:
+    python scripts/train_vae.py --config configs/vae_train.yaml
+    python scripts/train_vae.py --config configs/vae_train.yaml --data_root /path/to/data
 """
 
-import os
 import argparse
+import logging
+import os
+import sys
+
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import yaml
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
 
-# Import models
-from models.autoencoders.vae import VAE
-from models.autoencoders.losses import EnhancedVAELoss
-from datasets.imagenet_dataset import ImageNetDataset
-from utils.ema import EMA
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from kamba.data.imagenet import ImageNetDataset
+from kamba.models.vae import VAE
+from kamba.models.vae.loss import VAELoss
+from kamba.utils.checkpoint import save_checkpoint
+from kamba.utils.ema import EMA
+from kamba.utils.logger import setup_logger
+
+logger = logging.getLogger(__name__)
 
 
-def train_epoch_with_gan(
-    model,
-    dataloader,
-    criterion,
-    optimizer_vae,
-    optimizer_disc,
-    scaler,
-    ema,
-    device,
-    epoch,
-    writer,
-    use_amp=True
-):
-    """
-    Train for one epoch with GAN discriminator
-    
-    Training alternates between:
-    1. Update discriminator
-    2. Update VAE/generator
-    """
+def train_epoch(
+    model: VAE,
+    dataloader: DataLoader,
+    criterion: VAELoss,
+    optimizer_vae: torch.optim.Optimizer,
+    optimizer_disc: torch.optim.Optimizer | None,
+    scaler: torch.amp.GradScaler,
+    ema: EMA | None,
+    device: torch.device,
+    epoch: int,
+    use_amp: bool = True,
+    grad_clip_norm: float = 1.0,
+    gradient_accumulation_steps: int = 1,
+    log_every: int = 100,
+) -> dict[str, float]:
+    """Train for one epoch with optional GAN discriminator."""
     model.train()
-    
-    # Statistics
+
     stats = {
-        'vae_loss': 0,
-        'disc_loss': 0,
-        'recon_loss': 0,
-        'kl_loss': 0,
-        'perc_loss': 0
+        "vae_loss": 0.0,
+        "disc_loss": 0.0,
+        "recon_loss": 0.0,
+        "kl_loss": 0.0,
+        "perc_loss": 0.0,
     }
-    
-    pbar = tqdm(dataloader, desc=f'Epoch {epoch}')
-    global_step = epoch * len(dataloader)
-    
+
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+
     for batch_idx, batch in enumerate(pbar):
-        images = batch['image'].to(device)
-        current_step = global_step + batch_idx
-        
-        # ========== Update Discriminator ==========
-        optimizer_disc.zero_grad()
-        
-        with autocast(enabled=use_amp):
-            # Forward VAE
-            with torch.no_grad():
-                recon, mean, logvar = model(images)
-            
-            # Discriminator loss
-            disc_loss, disc_log = criterion(
-                recon, images, mean, logvar,
-                optimizer_idx=1  # Discriminator
+        images = batch["image"].to(device)
+
+        # === Update Discriminator ===
+        if optimizer_disc is not None:
+            optimizer_disc.zero_grad()
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                with torch.no_grad():
+                    recon, mean, logvar = model(images)
+                disc_loss, disc_log = criterion(
+                    recon, images, mean, logvar, optimizer_idx=1
+                )
+
+            scaler.scale(disc_loss).backward()
+            scaler.unscale_(optimizer_disc)
+            torch.nn.utils.clip_grad_norm_(
+                criterion.discriminator.parameters(), max_norm=grad_clip_norm
             )
-        
-        # Backward discriminator
-        scaler.scale(disc_loss).backward()
-        scaler.unscale_(optimizer_disc)
-        torch.nn.utils.clip_grad_norm_(criterion.discriminator.parameters(), max_norm=1.0)
-        scaler.step(optimizer_disc)
-        
-        # ========== Update VAE/Generator ==========
-        optimizer_vae.zero_grad()
-        
-        with autocast(enabled=use_amp):
-            # Forward VAE
+            scaler.step(optimizer_disc)
+
+        # === Update VAE ===
+        if batch_idx % gradient_accumulation_steps == 0:
+            optimizer_vae.zero_grad()
+
+        with torch.amp.autocast("cuda", enabled=use_amp):
             recon, mean, logvar = model(images)
-            
-            # VAE loss (including GAN generator loss)
             vae_loss, vae_log = criterion(
-                recon, images, mean, logvar,
-                optimizer_idx=0  # Generator
+                recon, images, mean, logvar, optimizer_idx=0
             )
-        
-        # Backward VAE
+            vae_loss = vae_loss / gradient_accumulation_steps
+
         scaler.scale(vae_loss).backward()
-        scaler.unscale_(optimizer_vae)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer_vae)
-        
-        # Update scaler
-        scaler.update()
-        
-        # Update EMA
-        if ema is not None:
-            ema.update(model)
-        
+
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            scaler.unscale_(optimizer_vae)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=grad_clip_norm
+            )
+            scaler.step(optimizer_vae)
+            scaler.update()
+
+            if ema is not None:
+                ema.update(model)
+
         # Logging
-        stats['vae_loss'] += vae_log['total_loss']
-        stats['disc_loss'] += disc_log.get('gan/d_loss', 0)
-        stats['recon_loss'] += vae_log['recon_loss']
-        stats['kl_loss'] += vae_log['kl_loss']
-        stats['perc_loss'] += vae_log.get('perceptual_loss', 0)
-        
-        # TensorBoard logging (every 100 steps)
-        if batch_idx % 100 == 0:
-            for key, value in vae_log.items():
-                writer.add_scalar(f'train/{key}', value, current_step)
-            for key, value in disc_log.items():
-                writer.add_scalar(f'train/{key}', value, current_step)
-        
-        # Progress bar
-        if batch_idx % 10 == 0:
+        stats["vae_loss"] += vae_log["total_loss"]
+        stats["disc_loss"] += disc_log.get("gan/d_loss", 0) if optimizer_disc else 0
+        stats["recon_loss"] += vae_log["recon_loss"]
+        stats["kl_loss"] += vae_log["kl_loss"]
+        stats["perc_loss"] += vae_log.get("perceptual_loss", 0)
+
+        if batch_idx % log_every == 0:
             pbar.set_postfix({
-                'vae': f"{vae_log['total_loss']:.4f}",
-                'disc': f"{disc_log.get('gan/d_loss', 0):.4f}",
-                'recon': f"{vae_log['recon_loss']:.4f}",
-                'kl': f"{vae_log['kl_loss']:.6f}"
+                "vae": f"{vae_log['total_loss']:.4f}",
+                "recon": f"{vae_log['recon_loss']:.4f}",
+                "kl": f"{vae_log['kl_loss']:.6f}",
             })
-    
-    # Average stats
+
     n = len(dataloader)
     return {k: v / n for k, v in stats.items()}
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, ema=None):
-    """Validate model with optional EMA"""
-    
-    # Use EMA weights if available
+def validate(
+    model: VAE,
+    dataloader: DataLoader,
+    criterion: VAELoss,
+    device: torch.device,
+    ema: EMA | None = None,
+) -> dict[str, float]:
+    """Validate model with optional EMA weights."""
     if ema is not None:
         ema.apply_shadow(model)
-    
+
     model.eval()
-    
-    stats = {
-        'total_loss': 0,
-        'recon_loss': 0,
-        'kl_loss': 0
-    }
-    
-    for batch in tqdm(dataloader, desc='Validating'):
-        images = batch['image'].to(device)
-        
-        # Forward (no sampling for validation)
+    stats = {"total_loss": 0.0, "recon_loss": 0.0, "kl_loss": 0.0}
+
+    for batch in tqdm(dataloader, desc="Validating"):
+        images = batch["image"].to(device)
         recon, mean, logvar = model(images, sample=False)
-        
-        # Loss (VAE only, no GAN)
         loss, loss_dict = criterion(recon, images, mean, logvar, optimizer_idx=0)
-        
-        stats['total_loss'] += loss_dict['total_loss']
-        stats['recon_loss'] += loss_dict['recon_loss']
-        stats['kl_loss'] += loss_dict['kl_loss']
-    
-    # Restore original weights
+
+        stats["total_loss"] += loss_dict["total_loss"]
+        stats["recon_loss"] += loss_dict["recon_loss"]
+        stats["kl_loss"] += loss_dict["kl_loss"]
+
     if ema is not None:
         ema.restore(model)
-    
+
     n = len(dataloader)
     return {k: v / n for k, v in stats.items()}
 
 
-def save_samples(model, val_loader, save_dir, epoch, device, num_samples=8):
-    """Save reconstruction samples"""
+@torch.no_grad()
+def save_samples(
+    model: VAE,
+    val_loader: DataLoader,
+    save_dir: str,
+    epoch: int,
+    device: torch.device,
+    num_samples: int = 8,
+) -> None:
+    """Save reconstruction comparison images."""
+    from torchvision.utils import make_grid, save_image
+
     model.eval()
-    
-    # Get a batch
     batch = next(iter(val_loader))
-    images = batch['image'][:num_samples].to(device)
-    
-    with torch.no_grad():
-        recon, _, _ = model(images, sample=False)
-    
-    # Save comparison
-    from torchvision.utils import save_image, make_grid
-    
+    images = batch["image"][:num_samples].to(device)
+    recon, _, _ = model(images, sample=False)
+
     comparison = torch.cat([images, recon])
     grid = make_grid(comparison, nrow=num_samples, normalize=True)
-    
-    save_path = os.path.join(save_dir, f'recon_epoch{epoch:03d}.png')
+    save_path = os.path.join(save_dir, f"recon_epoch{epoch:03d}.png")
     save_image(grid, save_path)
-    
-    print(f"   Saved samples to {save_path}")
+    logger.info("Saved samples to %s", save_path)
 
 
-def main(args):
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    print(f"Mixed precision: {args.use_amp}")
-    print(f"EMA decay: {args.ema_decay}")
-    
-    # Create directories
-    exp_dir = os.path.join('experiments', args.exp_name)
-    os.makedirs(exp_dir, exist_ok=True)
-    os.makedirs(os.path.join(exp_dir, 'checkpoints'), exist_ok=True)
-    os.makedirs(os.path.join(exp_dir, 'samples'), exist_ok=True)
-    
-    # TensorBoard
-    writer = SummaryWriter(os.path.join(exp_dir, 'logs'))
-    
+def main(config: dict) -> None:
+    """Main training loop."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
+
+    # Directories
+    exp_dir = os.path.join(
+        config["training"].get("output_dir", "experiments"),
+        config["training"].get("exp_name", "vae_default"),
+    )
+    ckpt_dir = os.path.join(exp_dir, "checkpoints")
+    sample_dir = os.path.join(exp_dir, "samples")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(sample_dir, exist_ok=True)
+
     # Dataset
-    print("\nLoading dataset...")
+    mc = config["model"]
+    tc = config["training"]
+    dc = config.get("data", {})
+    lc = config.get("logging", tc)
+
+    image_size = mc.get("image_size", 256)
+    data_root = dc.get("data_root", tc.get("data_root", ""))
+
     train_dataset = ImageNetDataset(
-        data_root=args.data_root,
-        split='train',
-        image_size=args.image_size,
-        center_crop=False  # Use augmentation
+        data_root=data_root, split="train", image_size=image_size, center_crop=False
     )
-    
     val_dataset = ImageNetDataset(
-        data_root=args.data_root,
-        split='val',
-        image_size=args.image_size,
-        center_crop=True  # No augmentation
+        data_root=data_root, split="val", image_size=image_size, center_crop=True
     )
-    
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=tc["batch_size"],
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=tc.get("num_workers", 4),
         pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False
+        persistent_workers=tc.get("num_workers", 4) > 0,
     )
-    
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=tc["batch_size"],
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True
+        num_workers=tc.get("num_workers", 4),
+        pin_memory=True,
     )
-    
-    print(f"Train: {len(train_dataset)} images")
-    print(f"Val: {len(val_dataset)} images")
-    
+    logger.info("Train: %d images, Val: %d images", len(train_dataset), len(val_dataset))
+
     # Model
-    print("\nCreating VAE model...")
     model = VAE(
-        in_channels=3,
-        latent_channels=args.latent_channels,
-        hidden_dims=args.hidden_dims,
-        image_size=args.image_size,
-        use_kan_decoder=args.use_kan
+        in_channels=mc.get("in_channels", 3),
+        latent_channels=mc.get("latent_channels", 4),
+        hidden_dims=tuple(mc.get("hidden_dims", [128, 256, 512, 512])),
+        image_size=image_size,
+        num_res_blocks=mc.get("num_res_blocks", 2),
+        dropout=mc.get("dropout", 0.0),
+        use_kan_decoder=mc.get("use_kan_decoder", True),
     ).to(device)
-    
-    # Loss (with GAN)
-    criterion = EnhancedVAELoss(
-        kl_weight=args.kl_weight,
-        perceptual_weight=args.perceptual_weight,
-        use_perceptual=args.use_perceptual,
-        use_gan=args.use_gan,
-        gan_weight=args.gan_weight,
-        disc_start_epoch=args.disc_start_epoch
+
+    # Loss
+    loss_cfg = config.get("loss", {})
+    use_gan = loss_cfg.get("use_gan", True)
+    criterion = VAELoss(
+        kl_weight=loss_cfg.get("kl_weight", 1e-6),
+        perceptual_weight=loss_cfg.get("perceptual_weight", 1.0),
+        use_perceptual=loss_cfg.get("use_perceptual", True),
+        use_gan=use_gan,
+        gan_weight=loss_cfg.get("gan_weight", 0.5),
+        disc_start_epoch=loss_cfg.get("disc_start_epoch", 10),
     )
-    
-    # Move discriminator to device
-    if args.use_gan:
+    if use_gan:
         criterion.discriminator.to(device)
-    
+
     # Optimizers
     optimizer_vae = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        betas=(0.9, 0.999),
-        weight_decay=0.01
+        model.parameters(), lr=tc["lr"], weight_decay=tc.get("weight_decay", 0.01)
     )
-    
     optimizer_disc = None
-    if args.use_gan:
+    if use_gan:
+        disc_lr = tc["lr"] * loss_cfg.get("disc_lr_factor", 0.5)
         optimizer_disc = AdamW(
             criterion.discriminator.parameters(),
-            lr=args.lr * 0.5,  # Discriminator learns slower
-            betas=(0.9, 0.999),
-            weight_decay=0.01
+            lr=disc_lr,
+            weight_decay=tc.get("weight_decay", 0.01),
         )
-    
-    # Scheduler
+
     scheduler_vae = CosineAnnealingLR(
-        optimizer_vae,
-        T_max=args.epochs,
-        eta_min=args.lr * 0.01
+        optimizer_vae, T_max=tc["epochs"], eta_min=tc["lr"] * 0.01
     )
-    
     scheduler_disc = None
-    if args.use_gan:
+    if use_gan:
         scheduler_disc = CosineAnnealingLR(
-            optimizer_disc,
-            T_max=args.epochs,
-            eta_min=args.lr * 0.005
+            optimizer_disc, T_max=tc["epochs"], eta_min=disc_lr * 0.01
         )
-    
+
     # EMA
     ema = None
-    if args.use_ema:
-        ema = EMA(model, decay=args.ema_decay, device=device)
-        print(f"EMA enabled with decay={args.ema_decay}")
-    
-    # Mixed precision
-    scaler = GradScaler(enabled=args.use_amp)
-    
-    # Training loop
-    best_val_loss = float('inf')
-    
-    print(f"\n{'='*80}")
-    print(f"Starting training for {args.epochs} epochs")
-    print(f"{'='*80}\n")
-    
-    for epoch in range(1, args.epochs + 1):
-        # Update discriminator schedule
+    if tc.get("use_ema", True):
+        ema = EMA(model, decay=tc.get("ema_decay", 0.9999), device=device)
+        logger.info("EMA enabled with decay=%s", tc.get("ema_decay", 0.9999))
+
+    # AMP
+    scaler = torch.amp.GradScaler("cuda", enabled=tc.get("use_amp", True))
+
+    # Resume
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if tc.get("resume_from"):
+        ckpt = torch.load(tc["resume_from"], map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer_vae.load_state_dict(ckpt["optimizer_vae_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_val_loss = ckpt.get("val_loss", float("inf"))
+        logger.info("Resumed from epoch %d", start_epoch - 1)
+
+    # Training
+    logger.info("Starting training for %d epochs", tc["epochs"])
+
+    for epoch in range(start_epoch, tc["epochs"] + 1):
         criterion.set_epoch(epoch)
-        
-        # Train
-        if args.use_gan:
-            train_stats = train_epoch_with_gan(
-                model, train_loader, criterion,
-                optimizer_vae, optimizer_disc,
-                scaler, ema, device, epoch, writer,
-                use_amp=args.use_amp
-            )
-        else:
-            # Fallback to simple training without GAN
-            # (implement similar to train_epoch_with_gan but simpler)
-            pass
-        
-        print(f"\nEpoch {epoch}/{args.epochs}")
-        print(f"Train - VAE Loss: {train_stats['vae_loss']:.4f}, "
-              f"Disc Loss: {train_stats['disc_loss']:.4f}")
-        
+
+        train_stats = train_epoch(
+            model, train_loader, criterion,
+            optimizer_vae, optimizer_disc,
+            scaler, ema, device, epoch,
+            use_amp=tc.get("use_amp", True),
+            grad_clip_norm=tc.get("grad_clip_norm", 1.0),
+            gradient_accumulation_steps=tc.get("gradient_accumulation_steps", 1),
+            log_every=lc.get("log_every", 100),
+        )
+
+        logger.info(
+            "Epoch %d/%d - VAE: %.4f, Disc: %.4f, Recon: %.4f, KL: %.6f",
+            epoch, tc["epochs"],
+            train_stats["vae_loss"], train_stats["disc_loss"],
+            train_stats["recon_loss"], train_stats["kl_loss"],
+        )
+
         # Validate
-        if epoch % args.val_every == 0:
+        if epoch % lc.get("val_every", 5) == 0:
             val_stats = validate(model, val_loader, criterion, device, ema)
-            
-            print(f"Val   - Loss: {val_stats['total_loss']:.4f}, "
-                  f"Recon: {val_stats['recon_loss']:.4f}, "
-                  f"KL: {val_stats['kl_loss']:.6f}")
-            
-            # TensorBoard
-            for key, value in val_stats.items():
-                writer.add_scalar(f'val/{key}', value, epoch)
-            
-            # Save best model
-            if val_stats['total_loss'] < best_val_loss:
-                best_val_loss = val_stats['total_loss']
-                
-                checkpoint = {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_vae_state_dict': optimizer_vae.state_dict(),
-                    'val_loss': val_stats['total_loss']
-                }
-                
-                if ema is not None:
-                    checkpoint['ema_state_dict'] = ema.state_dict()
-                
-                if args.use_gan:
-                    checkpoint['discriminator_state_dict'] = criterion.discriminator.state_dict()
-                    checkpoint['optimizer_disc_state_dict'] = optimizer_disc.state_dict()
-                
-                torch.save(
-                    checkpoint,
-                    os.path.join(exp_dir, 'checkpoints', 'vae_best.pth')
-                )
-                
-                print(f"✅ Saved best model (val_loss: {best_val_loss:.4f})")
-        
-        # Save samples
-        if epoch % args.sample_every == 0:
-            save_samples(model, val_loader, os.path.join(exp_dir, 'samples'), epoch, device)
-        
-        # Save checkpoint
-        if epoch % args.save_every == 0:
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_vae_state_dict': optimizer_vae.state_dict(),
-                'scheduler_vae_state_dict': scheduler_vae.state_dict()
-            }
-            
-            if ema is not None:
-                checkpoint['ema_state_dict'] = ema.state_dict()
-            
-            if args.use_gan:
-                checkpoint['discriminator_state_dict'] = criterion.discriminator.state_dict()
-                checkpoint['optimizer_disc_state_dict'] = optimizer_disc.state_dict()
-                checkpoint['scheduler_disc_state_dict'] = scheduler_disc.state_dict()
-            
-            torch.save(
-                checkpoint,
-                os.path.join(exp_dir, 'checkpoints', f'vae_epoch{epoch}.pth')
+            logger.info(
+                "Val - Loss: %.4f, Recon: %.4f, KL: %.6f",
+                val_stats["total_loss"], val_stats["recon_loss"], val_stats["kl_loss"],
             )
-        
-        # Step schedulers
+
+            if val_stats["total_loss"] < best_val_loss:
+                best_val_loss = val_stats["total_loss"]
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_vae_state_dict": optimizer_vae.state_dict(),
+                        "val_loss": best_val_loss,
+                        **({"ema_state_dict": ema.state_dict()} if ema else {}),
+                        **(
+                            {
+                                "discriminator_state_dict": criterion.discriminator.state_dict(),
+                                "optimizer_disc_state_dict": optimizer_disc.state_dict(),
+                            }
+                            if use_gan
+                            else {}
+                        ),
+                    },
+                    ckpt_dir,
+                    filename="vae_best.pth",
+                )
+                logger.info("Saved best model (val_loss: %.4f)", best_val_loss)
+
+        # Samples
+        if epoch % lc.get("sample_every", 10) == 0:
+            save_samples(model, val_loader, sample_dir, epoch, device)
+
+        # Periodic checkpoint
+        if epoch % lc.get("save_every", 10) == 0:
+            save_checkpoint(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_vae_state_dict": optimizer_vae.state_dict(),
+                    "scheduler_vae_state_dict": scheduler_vae.state_dict(),
+                },
+                ckpt_dir,
+                filename=f"vae_epoch{epoch}.pth",
+            )
+
         scheduler_vae.step()
         if scheduler_disc is not None:
             scheduler_disc.step()
-        
-        # Log learning rates
-        writer.add_scalar('lr/vae', optimizer_vae.param_groups[0]['lr'], epoch)
-        if optimizer_disc is not None:
-            writer.add_scalar('lr/disc', optimizer_disc.param_groups[0]['lr'], epoch)
-    
-    writer.close()
-    print(f"\n✅ Training completed! Best val loss: {best_val_loss:.4f}")
+
+    logger.info("Training completed. Best val loss: %.4f", best_val_loss)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train VAE with GAN (Improved)')
-    
-    # Data
-    parser.add_argument('--data_root', type=str, required=True)
-    parser.add_argument('--image_size', type=int, default=256)
-    
-    # Model
-    parser.add_argument('--latent_channels', type=int, default=4)
-    parser.add_argument('--hidden_dims', type=int, nargs='+', default=[128, 256, 512, 512])
-    parser.add_argument('--use_kan', action='store_true')
-    
-    # Loss
-    parser.add_argument('--kl_weight', type=float, default=1e-6)
-    parser.add_argument('--perceptual_weight', type=float, default=1.0)
-    parser.add_argument('--use_perceptual', action='store_true', default=True)
-    parser.add_argument('--use_gan', action='store_true', default=True)
-    parser.add_argument('--gan_weight', type=float, default=0.5)
-    parser.add_argument('--disc_start_epoch', type=int, default=10)
-    
-    # Training
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--num_workers', type=int, default=8)
-    
-    # Optimization
-    parser.add_argument('--use_amp', action='store_true', default=True)
-    parser.add_argument('--use_ema', action='store_true', default=True)
-    parser.add_argument('--ema_decay', type=float, default=0.9999)
-    
-    # Logging
-    parser.add_argument('--exp_name', type=str, default='vae_imagenet_improved')
-    parser.add_argument('--val_every', type=int, default=1)
-    parser.add_argument('--sample_every', type=int, default=5)
-    parser.add_argument('--save_every', type=int, default=10)
-    
+    parser = argparse.ArgumentParser(description="Train VAE")
+    parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
+    parser.add_argument("--data_root", type=str, help="Override data root path")
+    parser.add_argument("--exp_name", type=str, help="Override experiment name")
     args = parser.parse_args()
-    
-    main(args)
-    
+
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
+
+    # CLI overrides
+    if args.data_root:
+        config.setdefault("data", {})["data_root"] = args.data_root
+    if args.exp_name:
+        config.setdefault("training", {})["exp_name"] = args.exp_name
+
+    setup_logger("kamba", config["training"].get("output_dir", "experiments"))
+    main(config)
